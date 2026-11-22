@@ -26,6 +26,16 @@ bilibili 下架了很多视频，之前收藏和缓存的视频均无法播放�
 - 本 fork 发布页：<https://github.com/daohang-sun/m4s-converter/releases>
 - 上游发布页：<https://github.com/mzky/m4s-converter/releases/latest>
 
+## 界面预览
+
+以下截图来自当前 fork 版本的运行界面，图中的路径与视频名称为演示数据，用于展示界面布局和状态反馈。
+
+![输出预览界面](docs/screenshots/ui-preview.png)
+
+![转换进行中](docs/screenshots/ui-running.png)
+
+![运行日志](docs/screenshots/ui-logs.png)
+
 ## 本地构建
 
 需要 Go 1.23 及以上版本。
@@ -39,6 +49,11 @@ go build -tags windows -ldflags "-w -s" -o m4s-converter-amd64.exe
 ```
 
 也可以使用 `build.sh` 构建多平台版本。仓库内置 Windows 使用的 MP4Box；如需自定义，可通过 GUI 的“高级设置”或命令行 `-g` 参数指定。
+
+## 自动发布
+
+推送形如 `v1.0.0`、`v1.5.7-fork.1` 的 `v*` 标签时，GitHub Actions 会自动完成测试、构建 Windows GUI/CLI，并将产物上传到 Release。
+也可以在仓库 Actions 页面手动触发 `Release` 工作流。
 
 ## 使用说明
 
@@ -90,6 +105,11 @@ C:\Users\mzky\Videos\bilibili\output\【4K8K-世界各地的美景】\中国-美
 - 弹幕 XML 转 ASS：[kafuumi/converter](https://github.com/kafuumi/converter)
 - 视频合成工具：[GPAC / MP4Box](https://gpac.io)
 - 本工具无下载视频功能，仅重新封装本地缓存文件
+
+## AI 辅助说明
+
+本项目在界面重构、文档整理和自动化脚本编写过程中使用了 AI 辅助。
+所有提交前的代码、文档与发布内容均由仓库维护者检查和确认，最终责任由维护者承担。
 
 ## 反馈
 
