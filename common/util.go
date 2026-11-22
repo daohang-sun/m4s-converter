@@ -3,16 +3,17 @@ package common
 import (
 	"bufio"
 	"bytes"
-	"crypto/md5"
-	"encoding/hex"
+	"context"
 	"fmt"
 	"io"
 	"m4s-converter/conver"
+	"m4s-converter/internal"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	utils "github.com/mzky/utils/common"
 	"github.com/ncruces/zenity"
@@ -28,15 +29,30 @@ type Config struct {
 	OutputDir  string
 	GPACPath   string
 	Summarize  bool
+	GroupByUP  bool // 按 UP 主归类：输出目录为 output/UP主/合集/分P.mp4
+	NoWait     bool
+	Observer   func(ConversionEvent)
 	video      string
 	audio      string
 	ItemId     string
 	GroupId    string
 	Uid        string
+	PartId     string
 	Title      string
 	Uname      string
 	GroupTitle string
 	ExitFlag   bool
+
+	mu  sync.RWMutex
+	ctx context.Context
+
+	// assignedOutputs 记录本次 Synthesis 中每个输出文件归属于哪个分P，
+	// 用于同一文件夹下同名分P自动分配 _1/_2/... 后缀。
+	assignedOutputs map[string]string
+
+	// skipMetadataCheck 仅供输出预览使用：按候选文件名认领已存在的文件，
+	// 不启动 MP4Box 读取元数据，保证预览快速且可预测。
+	skipMetadataCheck bool
 }
 
 func (c *Config) overlay() string {
@@ -46,15 +62,38 @@ func (c *Config) overlay() string {
 	return "-n"
 }
 
-// SetExitFlag 设置退出标志
+// SetExitFlag 设置退出标志。
 func (c *Config) SetExitFlag(flag bool) {
+	c.mu.Lock()
 	c.ExitFlag = flag
+	c.mu.Unlock()
 }
 
-// ShouldExit 检查是否应该退出
+// ShouldExit 检查是否应该退出。
 func (c *Config) ShouldExit() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.ExitFlag
 }
+
+// SetContext 为GUI等调用方设置可取消的执行上下文；CLI默认使用Background。
+func (c *Config) SetContext(ctx context.Context) {
+	c.mu.Lock()
+	c.ctx = ctx
+	c.mu.Unlock()
+}
+
+func (c *Config) context() context.Context {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.ctx != nil {
+		return c.ctx
+	}
+	return context.Background()
+}
+
+var execCommandContext = exec.CommandContext
+
 func (c *Config) Composition(videoFile, audioFile, outputFile string) error {
 	var cmd *exec.Cmd
 	// 构建MP4Box命令行参数
@@ -67,8 +106,8 @@ func (c *Config) Composition(videoFile, audioFile, outputFile string) error {
 	// 添加字符集参数，指定使用UTF-8编码
 	args = append(args, "-charset", "utf8")
 
-	// 添加元数据标签
-	tags := fmt.Sprintf("title=%s:artist=%s:album=%s", c.GroupId, c.Uid, c.ItemId)
+	// 同一视频的各个分P共享GroupId/Uid/ItemId，comment用于区分分P身份。
+	tags := fmt.Sprintf("title=%s:artist=%s:album=%s:comment=%s", c.GroupId, c.Uid, c.ItemId, c.PartId)
 	args = append(args, "-tags", tags)
 	args = append(args,
 		// "-quiet", // 仅打印异常日志
@@ -76,7 +115,8 @@ func (c *Config) Composition(videoFile, audioFile, outputFile string) error {
 		"-add", videoFile+"#video",
 		"-add", audioFile+"#audio",
 		"-new", outputFile)
-	cmd = exec.Command(c.GPACPath, args...)
+	cmd = execCommandContext(c.context(), c.GPACPath, args...)
+	internal.HideChildConsole(cmd)
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -89,36 +129,15 @@ func (c *Config) Composition(videoFile, audioFile, outputFile string) error {
 
 	// 等待命令执行完成
 	if err := cmd.Run(); err != nil {
+		if c.context().Err() != nil {
+			// CommandContext终止进程后可能留下不完整的输出，不能让它影响断点续转。
+			_ = os.Remove(outputFile)
+		}
 		logrus.Errorf("合成视频文件失败:%s\n%s", outputFile, stdout.String())
 		return err
 	}
 
 	logrus.Info("已合成视频文件:", outputFile)
-	return nil
-}
-
-func (c *Config) FindM4sFiles(src string, info os.DirEntry, err error) error {
-	if err != nil {
-		return err
-	}
-	// 查找.m4s文件
-	if strings.HasSuffix(info.Name(), conver.M4sSuffix) {
-		var dst string
-		videoId, audioId := GetVAId(src)
-		if videoId != "" && audioId != "" {
-			if strings.Contains(info.Name(), audioId) { // 音频文件
-				dst = strings.ReplaceAll(src, conver.M4sSuffix, conver.AudioSuffix)
-			} else {
-				dst = strings.ReplaceAll(src, conver.M4sSuffix, conver.VideoSuffix)
-			}
-		}
-
-		if err = c.M4sToAV(src, dst); err != nil {
-			MessageBox(fmt.Sprintf("%v 转换异常：%v", src, err))
-			return err
-		}
-		logrus.Info("已将m4s转换为音视频文件: ", strings.TrimPrefix(dst, c.CachePath))
-	}
 	return nil
 }
 
@@ -150,17 +169,11 @@ func joinXmlUrl(cid string) string {
 	return "https://api.bilibili.com/x/v1/dm/list.so?oid=" + cid
 }
 
-// GetAudioAndVideo 从给定的缓存路径中查找音频和视频文件，并尝试下载并转换xml弹幕为ass格式
-// 参数:
-// - cachePath: 缓存路径，用于搜索音频、视频文件以及存储下载的弹幕文件
-// 返回值:
-// - video: 查找到的视频文件路径
-// - audio: 查找到的音频文件路径
-// - error: 在搜索、下载或转换过程中遇到的任何错误
+// GetAudioAndVideo 从给定的缓存路径中直接查找视频和音频 m4s 分片。
+// 不生成任何中间文件，MP4Box 可以直接读取 m4s 完成合并。
 func (c *Config) GetAudioAndVideo(cachePath string) (string, string, error) {
 	var video, audio string
 
-	// 遍历给定路径下的所有文件（不包括子目录）
 	entries, err := os.ReadDir(cachePath)
 	if err != nil {
 		return "", "", err
@@ -171,37 +184,41 @@ func (c *Config) GetAudioAndVideo(cachePath string) (string, string, error) {
 			// 如果是目录，递归查找
 			childVideo, childAudio, err := c.GetAudioAndVideo(filepath.Join(cachePath, entry.Name()))
 			if err == nil && childVideo != "" && childAudio != "" {
-				video = childVideo
-				audio = childAudio
+				video, audio = childVideo, childAudio
 				break
 			}
 			continue
 		}
 
-		// 如果是文件，检查是否为视频或音频文件
 		fileName := entry.Name()
-		if strings.HasSuffix(fileName, conver.VideoSuffix) {
-			video = filepath.Join(cachePath, fileName)
+		if !strings.HasSuffix(fileName, conver.M4sSuffix) {
+			continue
 		}
-		if strings.HasSuffix(fileName, conver.AudioSuffix) {
-			audio = filepath.Join(cachePath, fileName)
+		fullPath := filepath.Join(cachePath, fileName)
+		videoId, audioId := GetVAId(fullPath)
+		if videoId == "" || audioId == "" {
+			continue
+		}
+		if strings.Contains(fileName, audioId) {
+			audio = fullPath
+		} else {
+			video = fullPath
 		}
 	}
 
-	// 如果在当前目录及其子目录中都找不到视频或音频文件，返回错误
+	// 如果在当前目录及其子目录中都找不到视频或音频 m4s，返回错误
 	if video == "" || audio == "" {
-		return "", "", fmt.Errorf("找不到音频或视频文件: %s", cachePath)
+		return "", "", fmt.Errorf("找不到音频或视频 m4s 文件: %s", cachePath)
 	}
 
-	// 下载弹幕文件
+	// 下载弹幕文件（保持原有行为）
 	if !c.AssOFF {
-		// 保存当前的video路径，用于downloadXml
 		oldVideo := c.video
 		c.video = video
 		c.downloadXml()
 		c.video = oldVideo
 	}
-	return video, audio, nil // 返回找到的视频和音频文件路径
+	return video, audio, nil
 }
 func (c *Config) copyFile(src, dst string) error {
 	// 打开源文件
@@ -244,14 +261,78 @@ func (c *Config) copyFile(src, dst string) error {
 	return nil
 }
 
-func (c *Config) M4sToAV(src, dst string) error {
-	// 确保目标目录存在
-	dstDir := filepath.Dir(dst)
-	if err := os.MkdirAll(dstDir, os.ModePerm); err != nil {
-		logrus.Errorf("创建目标目录失败: %v", err)
+// m4sPadding 是旧版 B 站缓存 m4s 文件头部的 9 字节填充。
+const m4sPadding = "000000000"
+
+// prepareM4sInput 检查 m4s 头部，仅当存在旧式填充时在系统临时目录生成剥离后的副本。
+// 返回实际供 MP4Box 读取的路径以及是否需要调用 cleanup。
+// 新式缓存直接返回原路径，实现零额外写入的一步合并。
+func prepareM4sInput(src string) (string, bool, error) {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return "", false, err
+	}
+	head := make([]byte, len(m4sPadding))
+	n, readErr := io.ReadAtLeast(srcFile, head, len(m4sPadding))
+	_ = srcFile.Close()
+	if readErr != nil || string(head[:n]) != m4sPadding {
+		return src, false, nil
+	}
+
+	tmpFile, err := os.CreateTemp("", "m4s-*.m4s")
+	if err != nil {
+		return "", false, err
+	}
+	tmpPath := tmpFile.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+
+	srcFile, err = os.Open(src)
+	if err != nil {
+		cleanup()
+		return "", false, err
+	}
+	defer srcFile.Close()
+	if _, err = srcFile.Seek(int64(len(m4sPadding)), io.SeekStart); err != nil {
+		_ = tmpFile.Close()
+		cleanup()
+		return "", false, err
+	}
+	writer := bufio.NewWriter(tmpFile)
+	if _, err = io.Copy(writer, srcFile); err != nil {
+		_ = tmpFile.Close()
+		cleanup()
+		return "", false, err
+	}
+	if err = writer.Flush(); err != nil {
+		_ = tmpFile.Close()
+		cleanup()
+		return "", false, err
+	}
+	if err = tmpFile.Close(); err != nil {
+		cleanup()
+		return "", false, err
+	}
+	logrus.Info("旧式 m4s 缓存已在临时目录剥离头部填充: ", filepath.Base(src))
+	return tmpPath, true, nil
+}
+
+// composeFromM4s 直接从原始 m4s 分片合并到目标文件，不产生中间文件。
+func (c *Config) composeFromM4s(video, audio, outputFile string) (err error) {
+	videoInput, videoTemp, err := prepareM4sInput(video)
+	if err != nil {
 		return err
 	}
-	return c.copyFile(src, dst)
+	if videoTemp {
+		defer func() { _ = os.Remove(videoInput) }()
+	}
+	audioInput, audioTemp, err := prepareM4sInput(audio)
+	if err != nil {
+		return err
+	}
+	if audioTemp {
+		defer func() { _ = os.Remove(audioInput) }()
+	}
+	return c.Composition(videoInput, audioInput, outputFile)
 }
 
 // GetCachePath 获取用户视频缓存路径
@@ -306,144 +387,12 @@ func (c *Config) PanicHandler() {
 	}
 }
 
-// calculateFileHash 计算文件的MD5哈希值（流式计算）
-func (c *Config) calculateFileHash(filePath string) string {
-	file, err := os.Open(filePath)
-	if err != nil {
-		logrus.Errorf("打开文件失败: %v", err)
-		return ""
-	}
-	defer file.Close()
-
-	hash := md5.New()
-
-	// 使用流式读取，每次读取4KB
-	buffer := make([]byte, 4096)
-	for {
-		n, err := file.Read(buffer)
-		if err != nil && err != io.EOF {
-			logrus.Errorf("读取文件失败: %v", err)
-			return ""
-		}
-		if n == 0 {
-			break
-		}
-		// 只更新实际读取的数据
-		hash.Write(buffer[:n])
-	}
-
-	return hex.EncodeToString(hash.Sum(nil))
-}
-
-// calculateCombinedHash 计算音频和视频文件的组合哈希值（流式计算）
-func (c *Config) calculateCombinedHash(videoPath string, audioPath string) string {
-	hash := md5.New()
-
-	// 计算视频文件哈希（流式）
-	videoFile, err := os.Open(videoPath)
-	if err == nil {
-		// 使用流式读取，每次读取4KB
-		buffer := make([]byte, 4096)
-		for {
-			n, readErr := videoFile.Read(buffer)
-			if readErr != nil && readErr != io.EOF {
-				logrus.Errorf("读取视频文件失败: %v", readErr)
-				videoFile.Close()
-				return ""
-			}
-			if n == 0 {
-				break
-			}
-			// 只更新实际读取的数据
-			hash.Write(buffer[:n])
-		}
-		videoFile.Close()
-	} else {
-		logrus.Errorf("打开视频文件失败: %v", err)
-		return ""
-	}
-
-	// 计算音频文件哈希（流式）
-	audioFile, err := os.Open(audioPath)
-	if err == nil {
-		// 使用流式读取，每次读取4KB
-		buffer := make([]byte, 4096)
-		for {
-			n, readErr := audioFile.Read(buffer)
-			if readErr != nil && readErr != io.EOF {
-				logrus.Errorf("读取音频文件失败: %v", readErr)
-				audioFile.Close()
-				return ""
-			}
-			if n == 0 {
-				break
-			}
-			// 只更新实际读取的数据
-			hash.Write(buffer[:n])
-		}
-		audioFile.Close()
-	} else {
-		logrus.Errorf("打开音频文件失败: %v", err)
-		return ""
-	}
-
-	return hex.EncodeToString(hash.Sum(nil))
-}
-
-// isFileIdentical 检查输出文件是否与输入的音频和视频文件完全相同
-func (c *Config) isFileIdentical(outputFile string, videoPath string, audioPath string) bool {
-	// 首先检查文件是否存在
-	if !utils.IsExist(outputFile) {
-		return false
-	}
-
-	// 检查文件大小是否相近
-	outputInfo, err := os.Stat(outputFile)
-	if err != nil {
-		logrus.Errorf("获取输出文件信息失败: %v", err)
-		return false
-	}
-
-	videoInfo, err := os.Stat(videoPath)
-	if err != nil {
-		logrus.Errorf("获取视频文件信息失败: %v", err)
-		return false
-	}
-
-	audioInfo, err := os.Stat(audioPath)
-	if err != nil {
-		logrus.Errorf("获取音频文件信息失败: %v", err)
-		return false
-	}
-
-	// 检查文件大小是否相近（允许一定误差）
-	expectedSize := videoInfo.Size() + audioInfo.Size()
-	if abs(int64(outputInfo.Size())-expectedSize) > 1024*1024 { // 允许1MB误差
-		return false
-	}
-
-	// 对于重复检测，我们不能直接比较输入文件和输出文件的哈希
-	// 因为合成过程会改变文件结构。相反，我们需要为每个合成的文件
-	// 记录原始输入文件的哈希，或者使用其他方法来验证
-	// 这里我们使用一个简单的方法：如果文件大小相近，并且是由相同的输入文件合成的
-	// 我们就认为它是相同的文件
-	// 注意：这不是最精确的方法，但在大多数情况下是有效的
-	return true
-}
-
-// abs 计算整数的绝对值
-func abs(n int64) int64 {
-	if n < 0 {
-		return -n
-	}
-	return n
-}
-
 // getMp4Metadata 从MP4文件中读取元数据信息
 func (c *Config) getMp4Metadata(filePath string) (map[string]string, error) {
 	// 构建MP4Box命令行参数
 	args := []string{"-info", filePath}
-	cmd := exec.Command(c.GPACPath, args...)
+	cmd := execCommandContext(c.context(), c.GPACPath, args...)
+	internal.HideChildConsole(cmd)
 
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
@@ -454,153 +403,103 @@ func (c *Config) getMp4Metadata(filePath string) (map[string]string, error) {
 		return nil, err
 	}
 
-	// 解析输出
-	output := stdout.String()
-
-	metadata := make(map[string]string)
-
-	// 提取标题信息
-	if idx := strings.Index(strings.ToLower(output), "title:"); idx != -1 {
-		// 找到冒号后的内容，直到换行符
-		colonIdx := strings.Index(output[idx:], ":")
-		if colonIdx != -1 {
-			lineEndIdx := strings.Index(output[idx+colonIdx:], "\n")
-			if lineEndIdx != -1 {
-				value := strings.TrimSpace(output[idx+colonIdx+1 : idx+colonIdx+lineEndIdx])
-				if value != "" {
-					metadata["title"] = value
-				}
-			}
-		}
-	}
-
-	// 提取艺术家信息
-	if idx := strings.Index(strings.ToLower(output), "artist:"); idx != -1 {
-		// 找到冒号后的内容，直到换行符
-		colonIdx := strings.Index(output[idx:], ":")
-		if colonIdx != -1 {
-			lineEndIdx := strings.Index(output[idx+colonIdx:], "\n")
-			if lineEndIdx != -1 {
-				value := strings.TrimSpace(output[idx+colonIdx+1 : idx+colonIdx+lineEndIdx])
-				if value != "" {
-					metadata["artist"] = value
-				}
-			}
-		}
-	}
-
-	// 提取专辑信息
-	if idx := strings.Index(strings.ToLower(output), "album:"); idx != -1 {
-		// 找到冒号后的内容，直到换行符
-		colonIdx := strings.Index(output[idx:], ":")
-		if colonIdx != -1 {
-			lineEndIdx := strings.Index(output[idx+colonIdx:], "\n")
-			if lineEndIdx != -1 {
-				value := strings.TrimSpace(output[idx+colonIdx+1 : idx+colonIdx+lineEndIdx])
-				if value != "" {
-					metadata["album"] = value
-				}
-			}
-		}
-	}
-
-	return metadata, nil
+	return parseMP4Metadata(stdout.String()), nil
 }
 
-// isIdenticalFileExists 检查目录中是否存在与输入音频和视频文件内容相同的文件
+func parseMP4Metadata(output string) map[string]string {
+	metadata := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		for _, key := range []string{"title", "artist", "album", "comment"} {
+			prefix := key + ":"
+			if strings.HasPrefix(lower, prefix) {
+				metadata[key] = strings.TrimSpace(line[len(prefix):])
+			}
+		}
+	}
+	return metadata
+}
+
+// resolveOutputFile 为当前分P分配输出文件名。
+// 同一个输出文件夹下多个分P标题相同时，依次使用 part.mp4、part_1.mp4、part_2.mp4…
+// 分配前会认领磁盘上已经属于本分P的文件，保证断点续转不会重复生成新序号。
+func (c *Config) resolveOutputFile(dir, part string) string {
+	if c.assignedOutputs == nil {
+		c.assignedOutputs = make(map[string]string)
+	}
+	for i := 0; ; i++ {
+		name := part
+		if i > 0 {
+			name = fmt.Sprintf("%s_%d", part, i)
+		}
+		filePath := filepath.Join(dir, name+conver.Mp4Suffix)
+		if owner, taken := c.assignedOutputs[filePath]; taken && owner != c.PartId {
+			continue // 本次运行中已分配给其他分P
+		}
+		if !c.isOutputForCurrentPart(filePath) {
+			continue // 磁盘上的文件属于其他分P
+		}
+		c.assignedOutputs[filePath] = c.PartId
+		return filePath
+	}
+}
+
+// isOutputForCurrentPart 判断候选输出文件是否可以被当前分P认领。
+// 依据合成时写入 MP4 的元数据（title/artist/album/comment）识别分P身份，
+// 不使用任何旁文件。文件不存在时直接可用；元数据缺失的旧文件按候选名认领。
+func (c *Config) isOutputForCurrentPart(filePath string) bool {
+	if !utils.IsExist(filePath) {
+		return true
+	}
+	if c.skipMetadataCheck {
+		return true // 预览模式：存在即认领，避免为每个文件启动 MP4Box。
+	}
+
+	metadata, err := c.getMp4Metadata(filePath)
+	if err != nil {
+		return true // 元数据读不出来时按候选文件名认领，避免重复转换。
+	}
+	if metadata["title"] != c.GroupId || metadata["artist"] != c.Uid || metadata["album"] != c.ItemId {
+		return false
+	}
+	if comment := metadata["comment"]; comment != "" {
+		return comment == c.PartId
+	}
+	return true // 无分P标记的旧版文件：按候选文件名认领。
+}
+
+// isIdenticalFileExists 只在同一个分P内检测重复，避免跨分P误判。
+// 分P身份来自合成时写入 MP4 的元数据，不使用任何旁文件。
 func (c *Config) isIdenticalFileExists(dirPath string, videoPath string, audioPath string, part string) (bool, string) {
-	// 读取目录中的所有文件
 	files, err := os.ReadDir(dirPath)
 	if err != nil {
 		logrus.Errorf("读取目录失败: %v", err)
 		return false, ""
 	}
 
-	// 计算输入文件的组合哈希
-	inputHash := c.calculateCombinedHash(videoPath, audioPath)
-	if inputHash == "" {
-		// 如果无法计算哈希，使用文件大小进行比较
-		videoInfo, err := os.Stat(videoPath)
-		if err != nil {
-			logrus.Errorf("获取视频文件信息失败: %v", err)
-			return false, ""
-		}
-
-		audioInfo, err := os.Stat(audioPath)
-		if err != nil {
-			logrus.Errorf("获取音频文件信息失败: %v", err)
-			return false, ""
-		}
-
-		expectedSize := videoInfo.Size() + audioInfo.Size()
-
-		for _, file := range files {
-			if file.IsDir() {
-				continue
-			}
-
-			if !strings.HasSuffix(file.Name(), ".mp4") {
-				continue
-			}
-
-			filePath := filepath.Join(dirPath, file.Name())
-			fileInfo, err := os.Stat(filePath)
-			if err != nil {
-				logrus.Errorf("获取文件信息失败: %v", err)
-				continue
-			}
-
-			if abs(int64(fileInfo.Size())-expectedSize) > 1024*1024 {
-				continue
-			}
-
-			logrus.Info("发现相似大小的文件: ", filePath, " 大小:", fileInfo.Size(), " 预期:", expectedSize)
-			return true, filePath
-		}
-
-		return false, ""
-	}
-
-	// 检查每个MP4文件
 	for _, file := range files {
-		if file.IsDir() {
+		if file.IsDir() || !strings.HasSuffix(strings.ToLower(file.Name()), conver.Mp4Suffix) {
 			continue
 		}
-
-		if !strings.HasSuffix(file.Name(), ".mp4") {
-			continue
-		}
-
 		filePath := filepath.Join(dirPath, file.Name())
-
-		// 检查.hash文件
-		hashFilePath := strings.ReplaceAll(filePath, ".mp4", ".hash")
-		if utils.IsExist(hashFilePath) {
-			hashContent, err := os.ReadFile(hashFilePath)
-			if err == nil && string(hashContent) == inputHash {
-				logrus.Info("发现相同内容的文件: ", filePath)
+		metadata, metadataErr := c.getMp4Metadata(filePath)
+		if metadataErr != nil || metadata["title"] != c.GroupId || metadata["artist"] != c.Uid || metadata["album"] != c.ItemId {
+			continue
+		}
+		if metadata["comment"] != "" {
+			if metadata["comment"] == c.PartId {
+				logrus.Info("发现同一分P的已合并文件: ", filePath)
 				return true, filePath
 			}
+			continue
 		}
-
-		// 检查MP4文件的元数据
-		metadata, err := c.getMp4Metadata(filePath)
-		if err == nil {
-			if metadata["title"] == c.GroupId && metadata["artist"] == c.Uid && metadata["album"] == c.ItemId {
-				// 如果提供了part，还需要检查文件名中是否包含part
-				if part != "" {
-					if strings.Contains(file.Name(), part) {
-						logrus.Info("发现相同元数据和part的文件: ", filePath)
-						return true, filePath
-					}
-				} else {
-					logrus.Info("发现相同元数据的文件: ", filePath)
-					return true, filePath
-				}
-			}
+		// 旧MP4没有分P元数据，只允许精确同名匹配，不能使用Contains。
+		if file.Name() == part+conver.Mp4Suffix {
+			logrus.Info("发现同名的旧版已合并文件: ", filePath)
+			return true, filePath
 		}
 	}
-
 	return false, ""
 }
 

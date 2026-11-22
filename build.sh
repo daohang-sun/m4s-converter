@@ -17,6 +17,9 @@ GOOS=linux GOARCH=amd64 go build -tags "linux" -ldflags "-w -s" -o m4s-converter
 echo build for windows-amd64...
 GOOS=windows GOARCH=amd64 go build -tags "windows" -ldflags "-w -s" -o m4s-converter-amd64.exe
 #
+echo build for windows-amd64 GUI...
+GOOS=windows GOARCH=amd64 go build -tags "windows" -ldflags "-H=windowsgui -w -s" -o m4s-converter-gui.exe ./cmd/m4s-converter-gui
+#
 #echo build for Linux-arm64...
 #GOOS=linux GOARCH=arm64 GOARM=7 go build -tags "linux" -ldflags "-w -s" -o m4s-converter-linux_arm64 main.go
 # 设置目标操作系统为darwin(MacOS)

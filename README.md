@@ -1,3 +1,8 @@
+## Fork 说明
+
+本仓库是 [mzky/m4s-converter](https://github.com/mzky/m4s-converter) 的 GitHub fork，用于保存与分发本次界面优化版本。
+上游项目地址：<https://github.com/mzky/m4s-converter>。本仓库保留上游 MIT License 与免责声明，所有修改仅用于界面与交互优化。
+
 ## 为什么开发此程序？
 bilibili下架了很多视频，之前收藏和缓存的视频均无法播放
 

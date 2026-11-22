@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"m4s-converter/conver"
+	"m4s-converter/internal"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,17 +19,17 @@ import (
 
 func (c *Config) Synthesis() {
 	begin := time.Now().Unix()
+	c.assignedOutputs = make(map[string]string)
 	logrus.Println("查找缓存目录下可转换的文件...")
-	// 查找m4s文件，并转换为mp4和mp3
-	if err := filepath.WalkDir(c.CachePath, c.FindM4sFiles); err != nil {
-		MessageBox(fmt.Sprintf("查找并转换 m4s 文件异常：%v", err))
-		c.wait()
-	}
+	// 直接从原始 m4s 分片合并到输出目录，不在缓存目录生成任何中间文件。
 
 	dirs, err := GetCacheDir(c.CachePath) // 缓存根目录模式
 	if err != nil {
 		MessageBox(fmt.Sprintf("找不到 BiliBili 的缓存目录：%v", err))
 		c.wait()
+		if c.NoWait {
+			return
+		}
 	}
 
 	if dirs == nil {
@@ -39,8 +40,10 @@ func (c *Config) Synthesis() {
 		}
 	}
 
-	// 合成音视频文件
-	c.OutputDir = filepath.Join(c.CachePath, "output")
+	// 合成音视频文件；GUI可指定输出目录，CLI保持原默认行为。
+	if c.OutputDir == "" {
+		c.OutputDir = filepath.Join(c.CachePath, "output")
+	}
 	var outputFiles []string
 	var skipFilePaths []string
 	for _, v := range dirs {
@@ -54,15 +57,9 @@ func (c *Config) Synthesis() {
 			logrus.Error("找不到已修复的音频和视频文件:", e)
 			continue
 		}
-		info := filepath.Join(v, conver.VideoInfoJson)
-		if !utils.IsExist(info) {
-			info = filepath.Join(v, conver.VideoInfoSuffix)
-			if !utils.IsExist(info) {
-				info = filepath.Join(v, conver.PlayEntryJson)
-				if !utils.IsExist(info) {
-					continue
-				}
-			}
+		info := findVideoInfoFile(v)
+		if info == "" {
+			continue
 		}
 		infoStr, e := os.ReadFile(info)
 		if e != nil {
@@ -75,31 +72,13 @@ func (c *Config) Synthesis() {
 			continue
 		}
 
-		groupTitle := Filter(js.Get("groupTitle").String())
-		groupTitle = null2Str(groupTitle, Filter(js.Get("owner_name").String()))
+		vi := parseVideoInfo(js, v)
+		c.ItemId, c.GroupId, c.Uid, c.PartId = vi.ItemId, vi.GroupId, vi.Uid, vi.PartId
+		groupTitle, title, part, uname, status := vi.GroupTitle, vi.Title, vi.Part, vi.UName, vi.Status
 
-		title := Filter(js.Get("page_data").Get("download_subtitle").String())
-		title = null2Str(title, Filter(js.Get("title").String()))
-
-		part := Filter(js.Get("page_data").Get("part").String())
-
-		uname := Filter(js.Get("uname").String())
-		uname = null2Str(uname, Filter(js.Get("title").String()))
-
-		status := Filter(js.Get("status").String())
-		status = null2Str(status, Filter(js.Get("page_data").Get("download_title").String()))
-
-		itemId, e := js.Get("itemId").Int()
-		if itemId == 0 || e != nil {
-			itemId, _ = js.Get("owner_id").Int()
-		}
-		c.ItemId = strconv.Itoa(itemId)
-
-		// 设置 groupId 和 uid
-		c.GroupId = Filter(js.Get("groupId").String())
-		c.Uid = Filter(js.Get("uid").String())
-
-		if status != "completed" && status != "视频已缓存完成" && status != "" {
+		if cacheIncomplete(status) {
+			displayPart := null2Str(part, title)
+			c.emit(ConversionEvent{CacheDir: v, Group: groupTitle, Part: displayPart, Status: StatusSkipped, Progress: 100, Err: "缓存未完成"})
 			skipFilePaths = append(skipFilePaths, v)
 			logrus.Warn("未缓存完成,跳过合成", v, title+"-"+uname)
 			continue
@@ -107,29 +86,37 @@ func (c *Config) Synthesis() {
 		if !utils.IsExist(c.OutputDir) {
 			_ = os.MkdirAll(c.OutputDir, os.ModePerm)
 		}
-		groupPath := groupTitle + "-" + uname
-		groupDir := filepath.Join(c.OutputDir, groupPath)
+		relGroupPath := outputGroupPath(vi, c.GroupByUP)
+		groupDir := filepath.Join(c.OutputDir, relGroupPath)
 		if !utils.IsExist(groupDir) {
 			if err = os.MkdirAll(groupDir, os.ModePerm); err != nil {
 				MessageBox("无法创建目录：" + groupDir)
 				c.wait()
+				if c.NoWait {
+					return
+				}
 			}
 		}
-		// 生成输出文件名
-		// mp4Name := title + "-" + part + conver.Mp4Suffix
+		// 生成输出文件名；同一文件夹下同名分P自动追加 _1、_2、_3… 后缀。
 		if part == "" {
 			part = title
 		}
-		mp4Name := part + conver.Mp4Suffix
-		outputFile := filepath.Join(groupDir, mp4Name)
+		outputFile := c.resolveOutputFile(groupDir, part)
+		mp4Name := filepath.Base(outputFile)
 
 		// 设置元数据信息
 		c.Title = title
 		c.Uname = uname
 		c.GroupTitle = groupTitle
+		event := ConversionEvent{CacheDir: v, Group: groupTitle, Part: part, OutputFile: outputFile, Status: StatusPreparing, Progress: 10}
+		c.emit(event)
 
 		// 检查是否已经存在已合并文件
 		if utils.IsExist(outputFile) {
+			event.Status = StatusSkipped
+			event.Progress = 100
+			event.Err = "输出文件已存在，断点续转时跳过"
+			c.emit(event)
 			// 提取已合并文件的元数据
 			metadata, getErr := c.getMp4Metadata(outputFile)
 			if getErr == nil {
@@ -146,28 +133,39 @@ func (c *Config) Synthesis() {
 
 		// 检查目录中是否存在与输入音频和视频文件内容相同的文件
 		if exists, existingFile := c.isIdenticalFileExists(groupDir, video, audio, part); exists {
+			event.Status = StatusSkipped
+			event.Progress = 100
+			event.Err = "同一分P存在相同内容: " + existingFile
+			c.emit(event)
 			logrus.Warn("跳过完全相同的视频: ", existingFile)
 			continue
 		}
 
 		// 执行合成
-		if er := c.Composition(video, audio, outputFile); er != nil {
+		event.Status = StatusRunning
+		event.Progress = 50
+		c.emit(event)
+		if er := c.composeFromM4s(video, audio, outputFile); er != nil {
+			event.Progress = 100
+			event.Err = er.Error()
+			if c.ShouldExit() {
+				event.Status = StatusCancelled
+			} else {
+				event.Status = StatusFailed
+			}
+			c.emit(event)
 			logrus.Errorf("%s 合成失败", filepath.Base(outputFile))
 			continue
 		}
 
-		// 生成并存储文件哈希值，用于后续的重复检测
-		hashFile := strings.ReplaceAll(outputFile, ".mp4", ".hash")
-		inputHash := c.calculateCombinedHash(video, audio)
-		if inputHash != "" {
-			_ = os.WriteFile(hashFile, []byte(inputHash), 0644)
-		}
-
-		outputFiles = append(outputFiles, filepath.Join(groupPath, mp4Name))
+		event.Status = StatusCompleted
+		event.Progress = 100
+		c.emit(event)
+		outputFiles = append(outputFiles, filepath.Join(relGroupPath, mp4Name))
 	}
 
 	// 处理未合并的MP3和视频文件
-	if c.Summarize {
+	if c.Summarize && !c.ShouldExit() {
 		// 查找未合并的MP3和视频文件
 		for _, v := range dirs {
 			video, audio, e := c.GetAudioAndVideo(v)
@@ -176,15 +174,9 @@ func (c *Config) Synthesis() {
 			}
 
 			// 检查是否已经合成
-			info := filepath.Join(v, conver.VideoInfoJson)
-			if !utils.IsExist(info) {
-				info = filepath.Join(v, conver.VideoInfoSuffix)
-				if !utils.IsExist(info) {
-					info = filepath.Join(v, conver.PlayEntryJson)
-					if !utils.IsExist(info) {
-						continue
-					}
-				}
+			info := findVideoInfoFile(v)
+			if info == "" {
+				continue
 			}
 			infoStr, e := os.ReadFile(info)
 			if e != nil {
@@ -195,22 +187,17 @@ func (c *Config) Synthesis() {
 				continue
 			}
 
-			groupTitle := Filter(js.Get("groupTitle").String())
-			groupTitle = null2Str(groupTitle, Filter(js.Get("owner_name").String()))
-			uname := Filter(js.Get("uname").String())
-			uname = null2Str(uname, Filter(js.Get("title").String()))
-			title := Filter(js.Get("page_data").Get("download_subtitle").String())
-			title = null2Str(title, Filter(js.Get("title").String()))
+			vi := parseVideoInfo(js, v)
+			title := vi.Title
 
 			// 添加空值检查，避免创建空目录名或尝试复制空文件路径
-			if groupTitle == "" && uname == "" {
+			if vi.OwnerName == "" && vi.GroupTitle == "" && vi.RawGroup == "" {
 				logrus.Warn("项目信息为空，跳过处理未合并文件: ", v)
 				continue
 			}
 
 			// 创建项目特定的未合并文件夹
-			groupPath := groupTitle + "-" + uname
-			groupDir := filepath.Join(c.OutputDir, groupPath)
+			groupDir := filepath.Join(c.OutputDir, outputGroupPath(vi, c.GroupByUP))
 			if !utils.IsExist(groupDir) {
 				if err = os.MkdirAll(groupDir, os.ModePerm); err != nil {
 					logrus.Error("创建项目目录失败: ", err)
@@ -259,8 +246,10 @@ func (c *Config) Synthesis() {
 	if outputFiles != nil {
 		logrus.Printf("# 输出目录:\n%s", color.CyanString(c.OutputDir))
 		logrus.Printf("# 合成的文件:\n%s", color.CyanString(strings.Join(outputFiles, "\n")))
-		// 打开合成文件目录
-		go OpenFolder(c.OutputDir)
+		// 保持CLI原行为；GUI由用户主动点击“打开输出目录”。
+		if !c.NoWait && !c.ShouldExit() {
+			go OpenFolder(c.OutputDir)
+		}
 	} else {
 		logrus.Warn("未合成任何文件！")
 	}
@@ -273,7 +262,9 @@ func (c *Config) findMp4Info(fp, sub string) bool {
 	if !utils.IsExist(c.GPACPath) {
 		return false
 	}
-	ret, err := exec.Command(c.GPACPath, "-info", fp).CombinedOutput()
+	cmd := exec.Command(c.GPACPath, "-info", fp)
+	internal.HideChildConsole(cmd)
+	ret, err := cmd.CombinedOutput()
 	if err != nil {
 		return false
 	}
@@ -287,7 +278,33 @@ func null2Str(s string, value string) string {
 	return value
 }
 
+func jsonIdentifier(js *simplejson.Json, path ...string) string {
+	value := js.GetPath(path...)
+	if text, err := value.String(); err == nil && text != "" {
+		return text
+	}
+	if number, err := value.Int(); err == nil {
+		return strconv.Itoa(number)
+	}
+	return ""
+}
+
+// partIdentity 返回稳定且不含MP4Box标签分隔符的分P身份。
+// 优先使用B站cid，其次使用页码；老缓存缺少两者时才退回目录名。
+func partIdentity(js *simplejson.Json, cacheDir string) string {
+	if cid := null2Str(jsonIdentifier(js, "page_data", "cid"), jsonIdentifier(js, "cid")); cid != "" {
+		return "cid-" + cid
+	}
+	if page := null2Str(jsonIdentifier(js, "page_data", "page"), jsonIdentifier(js, "page")); page != "" {
+		return "page-" + page
+	}
+	return "dir-" + filepath.Base(cacheDir)
+}
+
 func (c *Config) wait() {
+	if c.NoWait {
+		return
+	}
 	fmt.Println("按任意键退出程序")
 	_, _ = fmt.Scanln()
 	os.Exit(0)
